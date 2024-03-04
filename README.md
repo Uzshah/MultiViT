@@ -17,7 +17,7 @@ python -m torch.distributed.launch --nproc_per_node=$nGPUs --use_env main.py
 ## Nornal Surface
 ![depth](./img/Normal.png)
 
-## Albed
+## Albedo
 ![depth](./img/Albedo.png)
 
 ## shading
