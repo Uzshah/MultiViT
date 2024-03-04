@@ -475,7 +475,7 @@ class Evaluator(object):
 
     def print(self, dir=None):
         avg_metrics = []
-        if self.settings.target == "depth":
+        if self.settings.target == "all" or self.settings.target == "depth":
             avg_metrics.append(self.metrics["depth/mre"].avg)
             avg_metrics.append(self.metrics["depth/mae"].avg)
             avg_metrics.append(self.metrics["depth/abs_"].avg)
@@ -487,21 +487,7 @@ class Evaluator(object):
             avg_metrics.append(self.metrics["depth/a1"].avg)
             avg_metrics.append(self.metrics["depth/a2"].avg)
             avg_metrics.append(self.metrics["depth/a3"].avg)
-            print("\n********************Depth*******************************")
-            print("\n  "+ ("{:>9} | " * 11).format("mre", "mae", "abs_", "abs_rel", "sq_rel", "rms", "rms_log", "log10", "a1", "a2", "a3"))
-            print(("&  {: 8.5f} " * 11).format(*avg_metrics))
-        else:
-            avg_metrics.append(self.metrics["depth/mre"].avg)
-            avg_metrics.append(self.metrics["depth/mae"].avg)
-            avg_metrics.append(self.metrics["depth/abs_"].avg)
-            avg_metrics.append(self.metrics["depth/abs_rel"].avg)
-            avg_metrics.append(self.metrics["depth/sq_rel"].avg)
-            avg_metrics.append(self.metrics["depth/rms"].avg)
-            avg_metrics.append(self.metrics["depth/log_rms"].avg)
-            avg_metrics.append(self.metrics["depth/log10"].avg)
-            avg_metrics.append(self.metrics["depth/a1"].avg)
-            avg_metrics.append(self.metrics["depth/a2"].avg)
-            avg_metrics.append(self.metrics["depth/a3"].avg)
+        if self.settings.target == "all" or self.settings.target == "shading":
             ## Shading
             avg_metrics.append(self.metrics["sh/mre"].avg)
             avg_metrics.append(self.metrics["sh/mae"].avg)
@@ -514,25 +500,28 @@ class Evaluator(object):
             avg_metrics.append(self.metrics["sh/a1"].avg)
             avg_metrics.append(self.metrics["sh/a2"].avg)
             avg_metrics.append(self.metrics["sh/a3"].avg)
+        if self.settings.target == "all" or self.settings.target == "normal":
             ##Normal 
             avg_metrics.append(self.metrics["norm/mse"].avg)
             avg_metrics.append(self.metrics["norm/ang_ls"].avg)
             avg_metrics.append(self.metrics["norm/pgp"].avg)
             avg_metrics.append(self.metrics["norm/psnr"].avg)
             avg_metrics.append(self.metrics["norm/ssim"].avg)
+        if self.settings.target == "all" or self.settings.target == "semantic":
             ## Semantic
             avg_metrics.append(self.metrics["ss/miou"].avg)
             avg_metrics.append(self.metrics["ss/acc"].avg)
             avg_metrics.append(self.metrics["ss/dice"].avg)
-            
+        if self.settings.target == "all" or self.settings.target == "albedo":
             ##Albeo
             avg_metrics.append(self.metrics["alb/mse"].avg)
             avg_metrics.append(self.metrics["alb/psnr"].avg)
             avg_metrics.append(self.metrics["alb/ssim"].avg)
-        
-            # print("\n********************Depth*******************************")
-            # print("\n  "+ ("{:>9} | " * 11).format("mre", "mae", "abs_", "abs_rel", "sq_rel", "rms", "rms_log", "log10", "a1", "a2", "a3"))
-            # print(("&  {: 8.5f} " * 11).format(*avg_metrics[:11]))
+            
+        if self.settings.target == "all":
+            print("\n********************Depth*******************************")
+            print("\n  "+ ("{:>9} | " * 11).format("mre", "mae", "abs_", "abs_rel", "sq_rel", "rms", "rms_log", "log10", "a1", "a2", "a3"))
+            print(("&  {: 8.5f} " * 11).format(*avg_metrics[:11]))
     
             print("\n********************Shading*******************************")
             print("\n  "+ ("{:>9} | " * 11).format("mre", "mae", "abs_", "abs_rel", "sq_rel", "rms", "rms_log", "log10", "a1", "a2", "a3"))
@@ -549,7 +538,28 @@ class Evaluator(object):
             print("\n********************Albedo*******************************")
             print(" \n" + ("{:>9} | "*3 ).format("mse", "psnr", "ssim"))
             print(("&  {: 8.5f} "*3).format(*avg_metrics[30:]))
+        if self.settings.target == "depth":
+            print("\n********************Depth*******************************")
+            print("\n  "+ ("{:>9} | " * 11).format("mre", "mae", "abs_", "abs_rel", "sq_rel", "rms", "rms_log", "log10", "a1", "a2", "a3"))
+            print(("&  {: 8.5f} " * 11).format(*avg_metrics))
+        if self.settings.target == "shading":
+            print("\n********************Shading*******************************")
+            print("\n  "+ ("{:>9} | " * 11).format("mre", "mae", "abs_", "abs_rel", "sq_rel", "rms", "rms_log", "log10", "a1", "a2", "a3"))
+            print(("&  {: 8.5f} " * 11).format(*avg_metrics))
+        if self.settings.target == "normal":
+            print("\n********************Normal*******************************")
+            print("\n  "+ ("{:>9} | " * 5).format("mse", "ang_ls", "pgp", "psnr", "ssim"))
+            print(("&  {: 8.5f} " * 5).format(*avg_metrics))
+        if self.settings.target == "semantic":
+            print("\n********************Semantic*******************************")
+            print("\n  "+ ("{:>9} | " * 3).format("miou", "acc", "dice"))
+            print(("&  {: 8.5f} " * 3).format(*avg_metrics))
+        if self.settings.target == "albedo":
+            print("\n********************Albedo*******************************")
+            print(" \n" + ("{:>9} | "*3 ).format("mse", "psnr", "ssim"))
+            print(("&  {: 8.5f} "*3).format(*avg_metrics))
 
+        
         if dir is not None:
             file = os.path.join(dir, "result.txt")
             with open(file, 'w') as f:
