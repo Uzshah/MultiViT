@@ -6,6 +6,20 @@ import numpy as np
 # Depth Prediction Metrics
 #==========================
 
+# from mmseg.evaluation import metrics
+# miou_metrics = metrics.IoUMetric(collect_device='gpu')
+
+
+# def compute_miou(gt_semantic, pred_semantic):
+#     samples = {'pred_sem_seg': {'data': None,}, 'gt_sem_seg': {'data': None},}
+#     samples['pred_sem_seg']['data'] = torch.argmax(F.softmax(pred_semantic, dim=1), dim=1)
+#     samples['gt_sem_seg']['data'] = torch.argmax(gt_semantic, dim=1)
+#     samples = [samples]
+#     miou_metrics.process(None, data_samples=samples)
+#     miou_metrics.compute_metrics(criterion2.results)
+    
+    
+
 def compute_depth_metrics(gt, pred, mask=None, median_align=True):
     """Computation of metrics between predicted and ground truth depths
     """
@@ -139,6 +153,8 @@ def angular_error(n_gt, n_hat):
 
     return angle_error_rad
 
+
+
 # Function to calculate the Average Angular Error (AAE)
 def average_angular_error(n_gt, n_hat):
     n_gt, n_hat = n_gt.cuda(), n_hat.cuda()
@@ -154,7 +170,7 @@ def proportion_good_pixels(n_gt, n_hat, phi=20):
     return pgp
 
 
-def mIoU(mask, pred_mask, smooth=1e-10, n_classes=151):
+def mIoU(mask, pred_mask, smooth=1e-10, n_classes=14):
     with torch.no_grad():
         pred_mask = F.softmax(pred_mask, dim=1)
         pred_mask = torch.argmax(pred_mask, dim=1)
@@ -193,11 +209,32 @@ def dice_coefficient(y_true, y_pred, smooth=1.):
     dice = (2. * intersection + smooth) / (torch.sum(y_true) + torch.sum(y_pred) + smooth)
     return dice
 
+def mean_angular_error(gt,pred):
+    gt_n = -1 + 2.0*gt
+    pred_n = -1 +2.0*pred
+    
+    device = torch.device(gt.device)
+    
+    gt_norm = torch.norm(gt_n, p=2, dim=1, keepdim=True)
+    pred_norm = torch.norm(pred_n, p=2, dim=1, keepdim=True)
+    pi = 2 * torch.acos(torch.zeros(1,device=device)).item()
+    valid_gt_n = gt_norm > 0
+    valid_pred_n = pred_norm > 0
+    gt_n = gt_n / torch.where(valid_gt_n, gt_norm, torch.tensor(1.0).to(device))
+    pred_n = pred_n / torch.where(valid_pred_n, pred_norm, torch.tensor(1.0).to(device))
+    # Calculate the cosine of the angular error
+    cos_angle_error = torch.clamp(torch.sum(gt_n * pred_n, dim=1), -1.0, 1.0)
+    # Calculate the angle in radians
+    angle_error_deg  = torch.rad2deg( torch.acos(cos_angle_error) * valid_gt_n )
+    pgp5 = torch.mean((angle_error_deg <= 5).float())
+    pgp10 = torch.mean((angle_error_deg <= 10).float()) 
+    pgp20 = torch.mean((angle_error_deg <= 20).float())
+    return angle_error_deg.mean(),pgp5,pgp10,pgp20
+
 def compute_normal_metrics(gt_normal, pred_normal, mask):
     mse, psnr_, ssim = compute_alb_metrics(gt_normal, pred_normal, mask)
-    ang = average_angular_error(gt_normal, pred_normal)
-    pgp = proportion_good_pixels(gt_normal, pred_normal) 
-    return [mse, ang, pgp, psnr_, ssim]
+    ang, pgp5,pgp10,pgp20 = mean_angular_error(gt_normal, pred_normal)
+    return [mse, ang, pgp5, pgp10, pgp20, psnr_, ssim]
 
 def compute_semantic_metrics(gt_semantic, pred_semantic):
     miou = mIoU(gt_semantic, pred_semantic)
@@ -352,7 +389,9 @@ class Evaluator(object):
             ##Normal
             self.metrics["norm/mse"] = AverageMeter()
             self.metrics["norm/ang_ls"] = AverageMeter()
-            self.metrics["norm/pgp"] = AverageMeter()
+            self.metrics["norm/pgp5"] = AverageMeter()
+            self.metrics["norm/pgp10"] = AverageMeter()
+            self.metrics["norm/pgp20"] = AverageMeter()
             self.metrics["norm/psnr"] = AverageMeter()
             self.metrics["norm/ssim"] = AverageMeter()
         if self.settings.target =="all" or self.settings.target =="semantic":
@@ -401,7 +440,9 @@ class Evaluator(object):
             # Normal 
             self.metrics["norm/mse"].reset()
             self.metrics["norm/ang_ls"].reset()
-            self.metrics["norm/pgp"].reset()
+            self.metrics["norm/pgp5"].reset()
+            self.metrics["norm/pgp10"].reset()
+            self.metrics["norm/pgp20"].reset()
             self.metrics["norm/psnr"].reset()
             self.metrics["norm/ssim"].reset()
         if self.settings.target =="all" or self.settings.target =="semantic":
@@ -436,7 +477,8 @@ class Evaluator(object):
             self.metrics["depth/a3"].update(a3, N)
         if self.settings.target =="all" or self.settings.target =="shading":
             N = gt_shading.shape[0]
-    
+            mre, mae, abs_, abs_rel, sq_rel, rms, rms_log, log10, a1, a2, a3 = \
+                compute_shading_metrics(gt_shading, pred_shading, dmask, self.median_align)
             self.metrics["sh/mre"].update(mre, N)
             self.metrics["sh/mae"].update(mae, N)
             self.metrics["sh/abs_"].update(abs_, N)
@@ -458,10 +500,12 @@ class Evaluator(object):
         if self.settings.target =="all" or self.settings.target =="normal":
             N = gt_normal.shape[0]
             # Normal
-            mse, ang_ls, pgp, norm_psnr, norm_ssim = compute_normal_metrics(gt_normal, pred_normal, mask) 
+            mse, ang_ls, pgp5, pgp10, pgp20,norm_psnr, norm_ssim = compute_normal_metrics(gt_normal, pred_normal, mask) 
             self.metrics["norm/mse"].update(mse, N)
             self.metrics["norm/ang_ls"].update(ang_ls, N)
-            self.metrics["norm/pgp"].update(pgp, N)
+            self.metrics["norm/pgp5"].update(pgp5, N)
+            self.metrics["norm/pgp10"].update(pgp10, N)
+            self.metrics["norm/pgp20"].update(pgp20, N)
             self.metrics["norm/psnr"].update(norm_psnr, N)
             self.metrics["norm/ssim"].update(norm_ssim, N)
         if self.settings.target =="all" or self.settings.target =="semantic":
@@ -504,7 +548,9 @@ class Evaluator(object):
             ##Normal 
             avg_metrics.append(self.metrics["norm/mse"].avg)
             avg_metrics.append(self.metrics["norm/ang_ls"].avg)
-            avg_metrics.append(self.metrics["norm/pgp"].avg)
+            avg_metrics.append(self.metrics["norm/pgp5"].avg)
+            avg_metrics.append(self.metrics["norm/pgp10"].avg)
+            avg_metrics.append(self.metrics["norm/pgp20"].avg)
             avg_metrics.append(self.metrics["norm/psnr"].avg)
             avg_metrics.append(self.metrics["norm/ssim"].avg)
         if self.settings.target == "all" or self.settings.target == "semantic":
@@ -528,16 +574,16 @@ class Evaluator(object):
             print(("&  {: 8.5f} " * 11).format(*avg_metrics[11:22]))
     
             print("\n********************Normal*******************************")
-            print("\n  "+ ("{:>9} | " * 5).format("mse", "ang_ls", "pgp", "psnr", "ssim"))
-            print(("&  {: 8.5f} " * 5).format(*avg_metrics[22:27]))
+            print("\n  "+ ("{:>9} | " * 7).format("mse", "ang_ls", "pgp5", "pgp10","pgp20","psnr", "ssim"))
+            print(("&  {: 8.5f} " * 7).format(*avg_metrics[22:29]))
     
             print("\n********************Semantic*******************************")
             print("\n  "+ ("{:>9} | " * 3).format("miou", "acc", "dice"))
-            print(("&  {: 8.5f} " * 3).format(*avg_metrics[27:30]))
+            print(("&  {: 8.5f} " * 3).format(*avg_metrics[29:32]))
     
             print("\n********************Albedo*******************************")
             print(" \n" + ("{:>9} | "*3 ).format("mse", "psnr", "ssim"))
-            print(("&  {: 8.5f} "*3).format(*avg_metrics[30:]))
+            print(("&  {: 8.5f} "*3).format(*avg_metrics[32:]))
         if self.settings.target == "depth":
             print("\n********************Depth*******************************")
             print("\n  "+ ("{:>9} | " * 11).format("mre", "mae", "abs_", "abs_rel", "sq_rel", "rms", "rms_log", "log10", "a1", "a2", "a3"))

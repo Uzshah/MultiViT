@@ -93,12 +93,12 @@ class Structured3D(data.Dataset):
         rgb = cv2.imread(rgb_name)
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         rgb = cv2.resize(rgb, dsize=(self.w, self.h), interpolation=cv2.INTER_CUBIC)
-        rgb = rgb.astype(np.float32)/255.0
+#         rgb = rgb.astype(np.float32)/255.0
         
         depth_name = os.path.join(self.root_dir, "depth", self.rgb_depth_list[idx])
         gt_depth = cv2.imread(depth_name, -1)
         gt_depth = cv2.resize(gt_depth, dsize=(self.w, self.h), interpolation=cv2.INTER_NEAREST)
-        gt_depth = gt_depth.astype(float)/4000.0
+        gt_depth = gt_depth.astype(float)/1000.0
         gt_depth = gt_depth.astype(np.float32)
         gt_depth[gt_depth > self.max_depth_meters] = self.max_depth_meters
 
