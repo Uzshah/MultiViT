@@ -32,7 +32,7 @@ class EleViT_Attn(nn.Module):
         # Split the input into multiple heads
         self.qkv_conv = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels * 3, kernel_size, 
-                          1, padding),
+                          1, padding, dilation_rate = dilation_rate),
                 nn.BatchNorm2d(out_channels * 3)
             )
         self.apply(self._init_weights)
@@ -196,14 +196,14 @@ class head(nn.Module):
         self.output = nn.Conv2d(lfeat//2, num_classes, kernel_size=3, padding = 1)
     def forward(self, x):
         for conv in self.decoder:
-            x = F.interpolate(x, scale_factor=(2,2), mode=self.mode)
             x = conv(x)
+            x = F.interpolate(x, scale_factor=(2,2), mode=self.mode)
             
         out = self.output(x)
         return out
         
 class MultiViT(nn.Module):
-    def __init__(self, num_classes, target, d= [64, 96, 128, 192, 256]):
+    def __init__(self, num_classes, target, d= [64, 96, 128, 192, 256], context_adjust = True):
         super().__init__()
         self.target = target
         self.input  = stem(3, d[0])
@@ -244,7 +244,9 @@ class MultiViT(nn.Module):
         
         self.upsampling1 = Upsampling(d[1]*2, d[0])
         self.decoder_layer1 = Attention_block(d[0]*2)
-
+        
+       
+        
     def forward(self, x):
         x = self.input(x)
         layer1 = self.encode_layer1(x)
@@ -276,6 +278,7 @@ class MultiViT(nn.Module):
         up1 = self.upsampling1(dlayer2)
         dlayer1 = torch.cat([up1, layer1], dim =1)
         dlayer1 = self.decoder_layer1(dlayer1)
+        dlayer1 +=x
         # print(dlayer1.size())
         
         outputs = {}
