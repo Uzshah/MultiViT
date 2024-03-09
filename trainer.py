@@ -23,12 +23,16 @@ from utils.losses import proportion_good_pixels, average_angular_error
 import utils.loss_gradient as loss_g
 import utils.losses as loss
 from utils.losses import BerhuLoss
+from utils.color_map import cmap as cp
 from models import *
 from models import MultiViT as MVT
-# from utils.stanford2d3d import Stanford2D3D
+from models.model import Panoformer as PanoBiT
+from utils.stanford2d3d import Stanford2d3d
 from utils.structured3d import Structured3D
-
+from collections import OrderedDict
 import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
 
 # Helper function to display logged assets in the Comet UI
 def display(tab=None):
@@ -74,6 +78,46 @@ def semantic_loss1(semantic, pred):
     ssloss = semantic_loss(pred, semantic) + loss.dice_coefficient_loss(semantic, pred)
     return ssloss
 
+def weighted_loss(inputs, outputs, log_vars):
+    loss = 0
+    precision_d = torch.exp(-log_vars[0]).to(inputs["depth"].device)
+    diff_d = (outputs["pred_depth"]-inputs["depth"])**2.
+    loss += torch.sum(precision_d * diff_d - log_vars[0].to(inputs["depth"].device), -1)
+    
+    precision_s = torch.exp(-log_vars[1]).to(inputs["depth"].device)
+    diff_s = semantic_loss1(outputs["pred_semantic"],inputs["semantic"])
+    loss += torch.sum(precision_s * diff_s - log_vars[1].to(inputs["depth"].device), -1) 
+    
+    precision_n = torch.exp(-log_vars[2]).to(inputs["depth"].device)
+    diff_n = (outputs["pred_normal"]-inputs["normal"])**2.
+    loss += torch.sum(precision_d * diff_d - log_vars[2].to(inputs["depth"].device), -1)
+    
+    return torch.mean(loss)
+
+class MultiTaskLoss(torch.nn.Module):
+    '''https://arxiv.org/abs/1705.07115'''
+    def __init__(self, is_regression, reduction='mean'):
+        super(MultiTaskLoss, self).__init__()
+        self.is_regression = is_regression
+        self.n_tasks = len(is_regression)
+        self.log_vars = torch.nn.Parameter(torch.zeros(self.n_tasks))
+        self.reduction = reduction
+
+    def forward(self, losses):
+        dtype = losses.dtype
+        device = losses.device
+        stds = (torch.exp(self.log_vars)**(1/2)).to(device).to(dtype)
+        is_regression = torch.Tensor([True, False, True]).to(device).to(dtype)
+        coeffs = 1 / ((is_regression+1)*(stds*2))
+        multi_task_losses = coeffs*losses + torch.log(stds)
+
+        if self.reduction == 'sum':
+            multi_task_losses = multi_task_losses.sum()
+        if self.reduction == 'mean':
+            multi_task_losses = multi_task_losses.mean()
+
+        return multi_task_losses
+
 
 class Trainer:
     def __init__(self, settings):
@@ -102,11 +146,25 @@ class Trainer:
         global_rank = util.get_rank()
     
         self.log_path = os.path.join(self.settings.log_dir, self.settings.model_name)
-        
-        train_dataset = Structured3D("Data/full", "", num_classes = 41, target = settings.target, 
-                                     height=settings.input_size[0], width=settings.input_size[1],
-                                      disable_color_augmentation=True, disable_LR_filp_augmentation=False, 
-                                     disable_yaw_rotation_augmentation=False, is_training = True)
+        if self.settings.dataset =="s3d":
+            train_dataset = Structured3D(self.settings.data_path, "", num_classes = 41, target = settings.target, 
+                                         height=settings.input_size[0], width=settings.input_size[1],
+                                          disable_color_augmentation=True, disable_LR_filp_augmentation=False, 
+                                         disable_yaw_rotation_augmentation=False, is_training = True)
+            val_dataset = Structured3D(self.settings.data_path, "", num_classes = 41, target = settings.target, 
+                                       height=settings.input_size[0], width=settings.input_size[1],
+                                        disable_color_augmentation=True, disable_LR_filp_augmentation=True, 
+                                        disable_yaw_rotation_augmentation=True, is_training = False)
+        if self.settings.dataset =="s2d3d":
+            train_dataset = Stanford2d3d(self.settings.data_path, self.settings.split[0], num_classes = 41, 
+                                         height=settings.input_size[0], width=settings.input_size[1],
+                                          disable_color_augmentation=True, disable_LR_filp_augmentation=True, 
+                                         disable_yaw_rotation_augmentation=True, is_training = True)
+            val_dataset = Stanford2d3d(self.settings.data_path, self.settings.split[1], num_classes = 41, 
+                                       height=settings.input_size[0], width=settings.input_size[1],
+                                        disable_color_augmentation=True, disable_LR_filp_augmentation=True, 
+                                        disable_yaw_rotation_augmentation=True, is_training = False)
+            
         sampler_train = torch.utils.data.DistributedSampler(
                 train_dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
@@ -115,29 +173,36 @@ class Trainer:
         
         num_train_samples = len(train_dataset)
         self.num_total_steps = num_train_samples // self.settings.batch_size * self.settings.num_epochs
-        val_dataset = Structured3D("Data/full", "", num_classes = 41, target = settings.target, 
-                                   height=settings.input_size[0], width=settings.input_size[1],
-                                    disable_color_augmentation=True, disable_LR_filp_augmentation=True, 
-                                    disable_yaw_rotation_augmentation=True, is_training = False)
+        
         sampler_test = torch.utils.data.DistributedSampler(
             val_dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
         self.val_loader = DataLoader(val_dataset, self.settings.batch_size,  sampler= sampler_test,
                                      num_workers=self.settings.num_workers, pin_memory=self.settings.pin_mem, drop_last=True)
-
+        self.log_var_depth = torch.zeros((1,), requires_grad=True)
+        self.log_var_semantic = torch.zeros((1,), requires_grad=True)
+        self.log_var_normal = torch.zeros((1,), requires_grad=True)
         self.settings.num_classes = 41
-        self.model = MVT.MultiViT(num_classes = self.settings.num_classes, target = self.settings.target)
+        if self.settings.model_name =="MVT":
+            self.model = MVT.MultiViT(num_classes = self.settings.num_classes, target = self.settings.target)
+        else:
+            self.model = PanoBiT(num_classes = self.settings.num_classes, target = self.settings.target)
         self.model.to(self.device)
         model_without_ddp = self.model
         if self.settings.distributed:
             self.model = torch.nn.parallel.DistributedDataParallel(
                     self.model, device_ids=[self.settings.gpu], find_unused_parameters=True)
             model_without_ddp = self.model.module
+        if self.settings.weighted_loss:
+            is_regression = torch.Tensor([True, False, True])
+            self.MultiTaskLoss_instance = MultiTaskLoss(is_regression = is_regression)
+            self.parameters_to_train = list(self.model.parameters()) + list(self.MultiTaskLoss_instance.parameters())
+        else:
+            self.parameters_to_train = list(self.model.parameters())
+
+        self.optimizer = optim.Adam(self.parameters_to_train,
+                                    self.settings.learning_rate)
         
-        self.parameters_to_train = list(self.model.parameters())
-
-        self.optimizer = optim.Adam(self.parameters_to_train, self.settings.learning_rate)
-
         if self.settings.load_weights_dir is not None:
             self.load_model()
 
@@ -165,8 +230,10 @@ class Trainer:
         self.epoch = 0
         self.step = 0
         self.start_time = time.time()
-        # self.validate()
-        for self.epoch in range(self.settings.num_epochs):
+        time.sleep(10)
+        self.validate()
+        for self.epoch in range(self.settings.start_epoch, self.settings.num_epochs):
+
             self.train_one_epoch()
             self.validate()
             if (self.epoch + 1) % self.settings.save_frequency == 0:
@@ -176,37 +243,46 @@ class Trainer:
         """Run a single epoch of training
         """
         self.model.train()
-
+        if self.settings.weighted_loss:
+            self.MultiTaskLoss_instance.train()
         pbar = tqdm.tqdm(self.train_loader)
         pbar.set_description("Training Epoch_{}".format(self.epoch))
-
         for batch_idx, inputs in enumerate(pbar):
 
             outputs, losses = self.process_batch(inputs, True)
-
+            if self.settings.weighted_loss:
+                losses_stacked = torch.stack([losses["depth_loss"],losses["semantic_loss"], losses["normal_loss"]])
+                multitaskloss = self.MultiTaskLoss_instance(losses_stacked)
+            else:
+                multitaskloss = losses["loss"]
             self.optimizer.zero_grad(),
-            losses["loss"].backward()
+            multitaskloss.backward()
             self.optimizer.step()
-
+#             weighted_loss += losses["loss"]
             # log less frequently after the first 1000 steps to save time & disk space
             early_phase = batch_idx % self.settings.log_frequency == 0 and self.step < 1000
             late_phase = self.step % 1000 == 0
             errors = []
             if early_phase or late_phase:
                 if self.settings.target == "all" or self.settings.target == "depth":
-                    errors.extend(compute_depth_metrics(inputs["depth"].detach(), outputs["pred_depth"].detach(), inputs["depth_mask"]))
+                    errors.extend(compute_depth_metrics(inputs["depth"].detach(), 
+                                                        outputs["pred_depth"].detach(), inputs["depth_mask"]))
                 if self.settings.target == "all" or self.settings.target == "shading":
-                    errors.extend(compute_shading_metrics(inputs["shading"].detach(), outputs["pred_shading"].detach(), inputs["val_mask"]))
+                    errors.extend(compute_shading_metrics(inputs["shading"].detach(), 
+                                                          outputs["pred_shading"].detach(), inputs["val_mask"]))
                 if self.settings.target == "all" or self.settings.target == "albedo":
-                    errors.extend(compute_alb_metrics(inputs["albedo"].detach(), outputs["pred_albedo"].detach(), inputs["val_mask"]))
+                    errors.extend(compute_alb_metrics(inputs["albedo"].detach(), 
+                                                      outputs["pred_albedo"].detach(), inputs["val_mask"]))
                 if self.settings.target == "all" or self.settings.target == "normal":
-                    errors.extend(compute_normal_metrics(inputs["normal"].detach(), outputs["pred_normal"].detach(), inputs["val_mask"]))
+                    errors.extend(compute_normal_metrics(inputs["normal"].detach(), 
+                                                         outputs["pred_normal"].detach(), inputs["val_mask"]))
                 if self.settings.target == "all" or self.settings.target == "semantic":
-                    errors.extend(compute_semantic_metrics(inputs["semantic"].detach(), outputs["pred_semantic"].detach()))
+                    errors.extend(compute_semantic_metrics(inputs["semantic"].detach(), 
+                                                           outputs["pred_semantic"].detach()))
                 
                 for i, key in enumerate(self.evaluator.metrics.keys()):
                     losses[key] = np.array(errors[i].cpu())
-                self.log("train", inputs, outputs, losses)
+                self.log("train", inputs, outputs, losses, batch_idx)
 
             self.step += 1
 
@@ -216,7 +292,7 @@ class Trainer:
     
         losses = {}
     
-        equi_inputs = inputs["rgb"]*inputs["val_mask"]
+        equi_inputs = inputs["normalized_rgb"]*inputs["val_mask"]
     
         outputs = self.model(equi_inputs)
         if self.settings.target == "all" or self.settings.target == "depth":
@@ -254,29 +330,30 @@ class Trainer:
             outputs["pred_semantic"] = outputs["pred_semantic"] * inputs["val_mask"]
             losses['semantic_loss'] = semantic_loss1(inputs["semantic"], outputs["pred_semantic"])
             losses['mIoUloss'] = 1 - mIoU(inputs["semantic"], outputs["pred_semantic"])
+#         
         if is_training:
             losses['loss'] = 0
             if self.settings.target == "all" or self.settings.target == "depth":
                 losses['loss'] += losses["depth_loss"]
-            if self.settings.target == "all" or self.settings.target == "shading":
-                losses['loss'] += losses["shading_loss"]
-            if self.settings.target == "all" or self.settings.target == "albedo":
-                losses['loss'] += losses["albedo_loss"]
+#             if self.settings.target == "all" or self.settings.target == "shading":
+#                 losses['loss'] += losses["shading_loss"]
+#             if self.settings.target == "all" or self.settings.target == "albedo":
+#                 losses['loss'] += losses["albedo_loss"]
             if self.settings.target == "all" or self.settings.target == "normal":
-                losses['loss'] += losses["normal_loss"] + (0.5*losses["re_normal_loss"])
+                losses['loss'] += losses["normal_loss"]
             if self.settings.target == "all" or self.settings.target == "semantic":
                 losses['loss'] += losses["semantic_loss"]
-            if self.settings.target == "all":
-                losses['loss'] += (0.2 * losses['joint_loss']) 
+#             if self.settings.target == "all":
+#                 losses['loss'] += (0.2 * losses['joint_loss']) 
             
         else:
             losses['loss'] = 0
             if self.settings.target == "all" or self.settings.target == "depth":
                 losses['loss'] += losses["depth_loss"]
-            if self.settings.target == "all" or self.settings.target == "shading":
-                losses['loss'] += losses["shading_loss"]
-            if self.settings.target == "all" or self.settings.target == "albedo":
-                losses['loss'] += losses["albedo_loss"]
+#             if self.settings.target == "all" or self.settings.target == "shading":
+#                 losses['loss'] += losses["shading_loss"]
+#             if self.settings.target == "all" or self.settings.target == "albedo":
+#                 losses['loss'] += losses["albedo_loss"]
             if self.settings.target == "all" or self.settings.target == "normal":
                 losses['loss'] += losses["normal_loss"]
             if self.settings.target == "all" or self.settings.target == "semantic":
@@ -292,7 +369,7 @@ class Trainer:
 
         pbar = tqdm.tqdm(self.val_loader)
         pbar.set_description("Validating Epoch_{}".format(self.epoch))
-
+        counter = 0
         with torch.no_grad():
             for batch_idx, inputs in enumerate(pbar):
                 outputs, losses = self.process_batch(inputs, False)
@@ -304,67 +381,89 @@ class Trainer:
                                                inputs["semantic"].detach(), outputs["pred_semantic"].detach(), \
                                                dmask=inputs["depth_mask"], mask = inputs["val_mask"])
                 if self.settings.target == "depth":
-                   self.evaluator.compute_eval_metrics(gt_depth=inputs["depth"].detach(), pred_depth=outputs["pred_depth"].detach(), \
+                   self.evaluator.compute_eval_metrics(gt_depth=inputs["depth"].detach(), 
+                                                       pred_depth=outputs["pred_depth"].detach(), \
                                                dmask=inputs["depth_mask"], mask = inputs["val_mask"]) 
                 if self.settings.target == "shading":
-                   self.evaluator.compute_eval_metrics(gt_shading=inputs["shading"].detach(), pred_shading=outputs["pred_depth"].detach(), \
+                   self.evaluator.compute_eval_metrics(gt_shading=inputs["shading"].detach(), 
+                                                       pred_shading=outputs["pred_depth"].detach(), \
                                              mask = inputs["val_mask"]) 
                 if self.settings.target == "normal":
-                   self.evaluator.compute_eval_metrics(gt_normal=inputs["normal"].detach(), pred_normal=outputs["pred_normal"].detach(), \
+                   self.evaluator.compute_eval_metrics(gt_normal=inputs["normal"].detach(), 
+                                                       pred_normal=outputs["pred_normal"].detach(), \
                                              mask = inputs["val_mask"]) 
                 if self.settings.target == "albedo":
-                   self.evaluator.compute_eval_metrics(gt_albedo=inputs["albedo"].detach(), pred_albedo=outputs["pred_albedo"].detach(), \
+                   self.evaluator.compute_eval_metrics(gt_albedo=inputs["albedo"].detach(), 
+                                                       pred_albedo=outputs["pred_albedo"].detach(), \
                                              mask = inputs["val_mask"]) 
                 if self.settings.target == "semantic":
-                   self.evaluator.compute_eval_metrics(gt_semantic=inputs["albedo"].detach(), pred_semantic=outputs["pred_albedo"].detach(), \
-                                             mask = inputs["val_mask"]) 
+                   self.evaluator.compute_eval_metrics(gt_semantic=inputs["semantic"].detach(), 
+                                                       pred_semantic=outputs["pred_semantic"].detach(), \
+                                              mask = inputs["val_mask"]) 
+                if counter%50==0 and self.settings.num_epochs ==0:
+                    self.log("val", inputs, outputs, losses, counter)
+                counter +=1
         self.evaluator.print()
-
+            
         for i, key in enumerate(self.evaluator.metrics.keys()):
             # print(key)
             losses[key] = np.array(self.evaluator.metrics[key].avg.cpu())
-        self.log("val", inputs, outputs, losses)
+        self.log("val", inputs, outputs, losses, batch_idx)
         del inputs, outputs, losses
 
-    def log(self, mode, inputs, outputs, losses):
+    def log(self, mode, inputs, outputs, losses, batch_idx=0):
         """Write an event to the tensorboard events file
         """
-        if self.settings.target == "semantic":
+        if self.settings.target == "semantic" or self.settings.target=="all":
             outputs["pred_semantic"] = F.softmax(outputs["pred_semantic"], dim=1)
-            outputs["pred_semantic"] = torch.argmax(outputs["pred_semantic"], dim=1).unsqueeze(1)
-            inputs["semantic"] = torch.argmax(inputs["semantic"], dim=1).unsqueeze(1)
+            outputs["pred_semantic"] = torch.argmax(outputs["pred_semantic"], dim=1)
+            inputs["semantic"] = torch.argmax(inputs["semantic"], dim=1)
         # print(gt_semantic.shape)
+#         inputs["shading"] = torch.clamp(inputs["shading"],0,1)
+#         outputs["pred_shading"] = torch.clamp(outputs["pred_shading"],0,1) 
+#         inputs["albedo"] = torch.clamp(inputs["albedo"],0,1)
+#         outputs["pred_albedo"] = torch.clamp(outputs["pred_albedo"],0,1) 
+#         inputs["normal"] = torch.clamp(inputs["normal"],0,1)
+#         outputs["pred_normal"] = torch.clamp(outputs["pred_normal"],0,1) 
         writer = self.writers[mode]
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
 
         for j in range(min(2, self.settings.batch_size)):  # write a maxmimum of four images
-            writer.add_image("rgb/{}".format(j), inputs["rgb"][j].data, self.step)
+            writer.add_image("rgb/{}-{}".format(j, batch_idx), inputs["rgb"][j].data, self.step)
             if self.settings.target == "all" or self.settings.target == "depth":
-                writer.add_image("gt_depth/{}".format(j),
-                                 inputs["depth"][j].data/inputs["depth"][j].data.max(),self.step)
-                writer.add_image("pred_depth/{}".format(j),
-                                 outputs['pred_depth'][j].data/outputs['pred_depth'][j].data.max(), self.step)
+                fig_target = plt.figure(0,figsize=(8,4),dpi=128,layout='tight')
+                plt.axis('off')
+                
+                plt.imshow(inputs["depth"][j].data.squeeze().cpu().numpy(), cmap='plasma')
+                writer.add_figure("gt_depth/{}-{}".format(j, batch_idx), fig_target ,self.step)
+                 
+                fig_target = plt.figure(0,figsize=(8,4),dpi=128,layout='tight')
+                plt.axis('off')                 
+                plt.imshow(outputs["pred_depth"][j].data.squeeze().cpu().numpy(), cmap='plasma')
+                writer.add_figure("pred_depth/{}-{}".format(j, batch_idx), fig_target ,self.step)
             if self.settings.target == "all" or self.settings.target == "shading":
-                writer.add_image("gt_shading/{}".format(j),
-                                 inputs['shading'][j].data/inputs['shading'][j].data.max(),self.step)
-                writer.add_image("pred_shading/{}".format(j),
-                                 outputs['pred_shading'][j].data/outputs['pred_shading'][j].data.max(), self.step)
+                writer.add_image("gt_shading/{}-{}".format(j, batch_idx), inputs["shading"][j].data,self.step)
+                writer.add_image("pred_shading/{}-{}".format(j, batch_idx), outputs["pred_shading"][j].data,self.step)
+                
             if self.settings.target == "all" or self.settings.target == "albedo":
-                writer.add_image("gt_albedo/{}".format(j),
-                                inputs['albedo'][j].data/inputs['albedo'][j].data.max(),self.step)
-                writer.add_image("pred_albedo/{}".format(j),
-                                 outputs['pred_albedo'][j].data/outputs['pred_albedo'][j].data.max(), self.step)
+                
+                writer.add_image("gt_albedo/{}-{}".format(j, batch_idx), inputs["albedo"][j].data ,self.step)
+                writer.add_image("pred_albedo/{}-{}".format(j, batch_idx), outputs["pred_albedo"][j].data ,self.step)
+                
             if self.settings.target == "all" or self.settings.target == "normal":
-                writer.add_image("gt_normal/{}".format(j),
-                                 inputs['normal'][j].data/inputs['normal'][j].data.max(),self.step)
-                writer.add_image("pred_normal/{}".format(j),
-                                 outputs['pred_normal'][j].data/outputs['pred_normal'][j].data.max(), self.step)
+                writer.add_image("gt_normal/{}-{}".format(j, batch_idx), inputs["normal"][j].data ,self.step)
+                writer.add_image("pred_normal/{}-{}".format(j, batch_idx), outputs["pred_normal"][j].data ,self.step)
+                
             if self.settings.target == "all" or self.settings.target == "semantic":
-                writer.add_image("gt_semantic/{}".format(j),
-                                 inputs['semantic'][j].data/inputs['semantic'][j].data.max(),self.step)
-                writer.add_image("pred_semantic/{}".format(j),
-                                 outputs['pred_semantic'][j].data/outputs['pred_semantic'][j].data.max(), self.step)
+                fig_target = plt.figure(0,figsize=(8,4),dpi=128,layout='tight')
+                plt.axis('off')
+                plt.imshow(inputs["semantic"][j].cpu().numpy(), cmap = cp)
+                writer.add_figure("gt_semantic/{}-{}".format(j,batch_idx), fig_target, self.step)
+                fig_pred = plt.figure(0,figsize=(8,4),dpi=128,layout='tight')
+                plt.axis('off')
+                plt.imshow(outputs["pred_semantic"][j].cpu().numpy(), cmap = cp)
+                writer.add_figure("pred_semantic/{}-{}".format(j,batch_idx), fig_pred, self.step)
             
             
     def save_settings(self):
@@ -403,7 +502,14 @@ class Trainer:
 
         path = os.path.join(self.settings.load_weights_dir, "{}.pth".format("model"))
         model_dict = self.model.state_dict()
-        pretrained_dict = torch.load(path)
+        pretrained_dict = torch.load(path, map_location="cuda:0")
+        if not self.settings.distributed:
+            pretrained_dict = OrderedDict((key.replace('module.', '', 1) \
+                                           if key.startswith('module.') else key, value) \
+                                          for key, value in pretrained_dict.items())
+#         if self.settings.dataset =="s2d3d":
+#             pretrained_dict['module.semantic.output.weight'] = torch.rand((27, 64, 3,3))
+#             pretrained_dict['module.semantic.output.bias'] = torch.rand((27))
         pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
         model_dict.update(pretrained_dict)
         self.model.load_state_dict(model_dict)
@@ -412,7 +518,7 @@ class Trainer:
         optimizer_load_path = os.path.join(self.settings.load_weights_dir, "adam.pth")
         if os.path.isfile(optimizer_load_path):
             print("Loading Adam weights")
-            optimizer_dict = torch.load(optimizer_load_path)
+            optimizer_dict = torch.load(optimizer_load_path, map_location="cuda:0")
             self.optimizer.load_state_dict(optimizer_dict)
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
